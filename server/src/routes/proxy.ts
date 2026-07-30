@@ -3,10 +3,11 @@ import { Router } from 'express';
 import type { Request, Response } from 'express';
 import { z } from 'zod';
 import type { ChatMessage, ChatToolCall, ModelListRow } from '@freellmapi/shared/types.js';
-import { routeRequest, resolveRoutingChain, resolveModelGroupCandidates, recordRateLimitHit, recordSuccess, hasEnabledVisionModel, hasEnabledToolsModel, hasOtherUsableKey, routingReserveTokens, type RouteResult, type ResolvedChain, type ChainRow } from '../services/router.js';
+import { routeRequest, resolveRoutingChain, resolveModelGroupCandidates, resolveStickyPreference, recordRateLimitHit, recordSuccess, hasEnabledVisionModel, hasEnabledToolsModel, hasOtherUsableKey, routingReserveTokens, type RouteResult, type ResolvedChain, type ChainRow } from '../services/router.js';
 import { recordRequest, recordTokens, setCooldown, getCooldownDurationForLimit, PAYMENT_REQUIRED_COOLDOWN_MS, MODEL_FORBIDDEN_COOLDOWN_MS, learnLimitFromError } from '../services/ratelimit.js';
 import { runEmbeddings, EmbeddingsError } from '../services/embeddings.js';
-import { runImageGeneration, runSpeech, MediaError } from '../services/media.js';
+import { runImageGeneration, runSpeech, runTranscription, MediaError, MAX_TRANSCRIPTION_BYTES } from '../services/media.js';
+import multer from 'multer';
 import { getDb, getUnifiedApiKey } from '../db/index.js';
 import { contentToString, messageHasImage, normalizeOutboundContent, sanitizeResponse } from '../lib/content.js';
 import { repairToolArguments, toolSchemaMap } from '../lib/tool-args.js';
@@ -14,14 +15,20 @@ import { sanitizeProviderErrorMessage } from '../lib/error-redaction.js';
 import { rescueInlineToolCalls, startsWithDialectMarker, couldBecomeDialectMarker, containsDialectMarker } from '../lib/tool-call-rescue.js';
 import { getContextHandoffMode, recordIncomingMessages, maybeInjectContextHandoff, recordSuccessfulModel, hasPriorModel, HANDOFF_MAX_TOKENS } from '../services/context-handoff.js';
 import { isFusionModel, runFusion, fusionConfigSchema, FusionError, FUSION_MODEL_ID } from '../services/fusion.js';
-import { isRetryableError, isPaymentRequiredError, isModelNotFoundError, isModelAccessForbiddenError } from '../lib/error-classify.js';
+import { isRetryableError, isPaymentRequiredError, isModelNotFoundError, isModelAccessForbiddenError, isClientAbortError, newClientAbortError } from '../lib/error-classify.js';
 import { logRequest } from '../lib/request-log.js';
+import { observeServedModel } from '../lib/served-model.js';
 import { parseCacheDirective, cacheActive, isCacheableTemperature, computeCacheKey, getCachedResponse, storeCachedResponse } from '../services/cache.js';
-import { runFallbackLoop, newFallbackState, recordUpstreamSuccess, exhaustedRetryError } from '../lib/fallback-loop.js';
+import { runFallbackLoop, newFallbackState, recordUpstreamSuccess, exhaustedRetryError, setFallbackHeaders, exhaustionErrorPayload, setExhaustionHeaders, type AttemptRecord } from '../lib/fallback-loop.js';
+import { routedViaValue, safeHeaderValue } from '../lib/header-value.js';
+import { applyTokenBudget, tokenBudgetMessage } from '../lib/guardrails.js';
+import { samplingParamSchemaFields, pickSamplingParams, supportedParametersForPlatforms } from '../lib/sampling-params.js';
+import { enforceJsonContent } from '../lib/structured-output.js';
 import type { Platform } from '@freellmapi/shared/types.js';
 import { inferQuotaPoolKey, type QuotaObservationContext } from '../services/provider-quota.js';
-import { isUnifyEnabled, getModelGroups, resolveRequestedIdToMembers } from '../services/model-groups.js';
+import { isUnifyEnabled, getModelGroups, resolveRequestedIdForDispatch } from '../services/model-groups.js';
 import { buildModelListing } from '../services/model-listing.js';
+import { compressRequest, formatCompressionHeader } from '../services/compression/pipeline.js';
 
 export const proxyRouter = Router();
 
@@ -52,11 +59,8 @@ export function timingSafeStringEqual(provided: string, expected: string): boole
 }
 
 // Extract the unified API key from an incoming request. Accepts both the
-// OpenAI-style `Authorization: Bearer <key>` header and the Anthropic-style
-// `x-api-key` header. Clients that speak the Anthropic wire format — notably
-// Claude Code routed through CC Switch (#103) — send the key in `x-api-key`
-// rather than a bearer token, and were getting a spurious "Invalid API key"
-// 401 before this fallback existed.
+// OpenAI Bearer, Anthropic x-api-key, and Gemini x-goog-api-key headers.
+// Query credentials remain scoped to the Gemini router.
 export function extractApiToken(req: Request): string | undefined {
   const bearer = req.headers.authorization?.replace(/^Bearer\s+/i, '').trim();
   if (bearer) return bearer;
@@ -64,7 +68,10 @@ export function extractApiToken(req: Request): string | undefined {
   const apiKeyHeader = req.headers['x-api-key'];
   const xApiKey = Array.isArray(apiKeyHeader) ? apiKeyHeader[0] : apiKeyHeader;
   const trimmed = xApiKey?.trim();
-  return trimmed || undefined;
+  if (trimmed) return trimmed;
+  const googleHeader = req.headers['x-goog-api-key'];
+  const googleKey = Array.isArray(googleHeader) ? googleHeader[0] : googleHeader;
+  return googleKey?.trim() || undefined;
 }
 
 function quotaContextForRoute(route: RouteResult, endpoint: string): QuotaObservationContext {
@@ -202,9 +209,11 @@ proxyRouter.get('/models', (req: Request, res: Response) => {
 
   // By default we return the WHOLE catalog (one row per model id), each tagged
   // with whether it is currently usable, so a client can see everything and know
-  // what's connected vs. disabled/keyless (#242). `?available=true` (alias
-  // `?connected=true`) narrows the list to only models that can serve a request
-  // right now — the previous default behavior. `available` is computed as
+  // what's connected vs. disabled/keyless (#242). `?available=true` (aliases
+  // `?connected=true`, `?ready=true`) narrows the list to only models that can
+  // serve a request right now — the previous default behavior. The `ready`
+  // alias is the machine-readable filter a meta-gateway uses (#433) to ask
+  // "which models can this instance actually serve now". `available` is computed as
   // "enabled AND an enabled key can serve it"; dedup prefers an available
   // instance of a model id over a disabled/keyless one.
   // Shared catalog listing (one source of truth for the OpenAI and Anthropic
@@ -215,7 +224,7 @@ proxyRouter.get('/models', (req: Request, res: Response) => {
   // conservative default and truncate long inputs before they reach us (#282).
   const { models: allListed, autoContextWindow } = buildModelListing();
 
-  const q = String(req.query.available ?? req.query.connected ?? '').toLowerCase();
+  const q = String(req.query.available ?? req.query.connected ?? req.query.ready ?? '').toLowerCase();
   const onlyAvailable = q === '1' || q === 'true' || q === 'yes';
   const listed = onlyAvailable ? allListed.filter(m => m.available === 1) : allListed;
 
@@ -259,6 +268,11 @@ proxyRouter.get('/models', (req: Request, res: Response) => {
         // Non-standard but additive: OpenAI clients ignore unknown fields.
         available: m.available === 1,
         unavailable_reason: m.available === 1 ? null : (m.enabled === 1 ? 'no_key' : 'disabled'),
+        // OpenRouter's field name; agents use it to pick knobs per model. For
+        // a unify group this is the intersection over member platforms — a
+        // param is only advertised when every platform the router might pick
+        // honors it.
+        supported_parameters: supportedParametersForPlatforms(m.platforms, { tools: m.supportsTools }),
       })),
     ],
   });
@@ -414,6 +428,10 @@ const chatCompletionSchema = z.object({
   // Fusion config — only meaningful when `model` is the virtual "fusion" id.
   // Ignored for every other model. See services/fusion.ts.
   fusion: fusionConfigSchema.optional(),
+  // Extended sampling + structured-output params (top_k, seed, penalties,
+  // logit_bias, logprobs, response_format, max_completion_tokens…), forwarded
+  // per the platform policy in lib/sampling-params.ts.
+  ...samplingParamSchemaFields,
 });
 
 // Upstream-error classifiers live in lib/error-classify.ts so the fusion
@@ -489,7 +507,7 @@ const ImageBody = z.object({
 });
 
 function mediaErrorType(status: number): string {
-  if (status === 400) return 'invalid_request_error';
+  if (status === 400 || status === 413) return 'invalid_request_error';
   if (status === 401) return 'authentication_error';
   if (status === 429) return 'rate_limit_error';
   return 'server_error';
@@ -550,12 +568,139 @@ proxyRouter.post('/audio/speech', async (req: Request, res: Response) => {
       input: parsed.data.input, voice: parsed.data.voice, format: parsed.data.response_format,
     });
     res.setHeader('Content-Type', result.contentType);
-    res.setHeader('X-Provider', result.platform);
+    res.setHeader('X-Provider', safeHeaderValue(result.platform));
     res.send(result.audio);
   } catch (err: any) {
     const status = err instanceof MediaError ? err.status : 502;
     const httpStatus = status >= 400 && status < 600 ? status : 502;
     res.status(httpStatus).json({ error: { message: `speech error: ${err?.message ?? 'unknown'}`, type: mediaErrorType(status) } });
+  }
+});
+
+// OpenAI-compatible speech-to-text (/v1/audio/transcriptions). Multipart form
+// upload, held in memory only (multer memoryStorage — audio bytes never touch
+// disk), routed through the STT provider chain in services/media.ts with the
+// same key/failover/cooldown machinery as the other media endpoints. The STT
+// registry (media_models, modality='transcription') is maintained by the
+// published catalog's `transcriptionModels` array via catalog-sync; on an
+// install that has never synced one, the endpoint answers 503 with code
+// 'no_transcription_models' until the first sync lands.
+//
+// response_format: 'json' (default, {"text": ...}), 'text' (plain string),
+// 'verbose_json' (OpenAI verbose shape when the provider returns segments,
+// graceful fallback to the plain json shape otherwise), 'vtt' (only from
+// providers that produce it natively — Cloudflare whisper). 'srt' is not
+// produced natively by any configured provider and is refused with 400
+// unsupported_format rather than synthesized.
+const transcriptionUpload = multer({
+  storage: multer.memoryStorage(),
+  limits: { fileSize: MAX_TRANSCRIPTION_BYTES, files: 1 },
+});
+
+const TRANSCRIPTION_FORMATS = new Set(['json', 'text', 'verbose_json', 'srt', 'vtt']);
+
+function transcriptionBadRequest(res: Response, message: string, code?: string): void {
+  res.status(400).json({ error: { message, type: 'invalid_request_error', ...(code ? { code } : {}) } });
+}
+
+proxyRouter.post('/audio/transcriptions', (req: Request, res: Response, next) => {
+  // Auth before the multipart body is parsed: an unauthenticated caller's
+  // upload is never buffered.
+  const token = extractApiToken(req);
+  const unifiedKey = getUnifiedApiKey();
+  if (!token || !timingSafeStringEqual(token, unifiedKey)) {
+    res.status(401).json({ error: { message: 'Invalid API key', type: 'authentication_error' } });
+    return;
+  }
+  transcriptionUpload.single('file')(req, res, (err: unknown) => {
+    if (err) {
+      if (err instanceof multer.MulterError && err.code === 'LIMIT_FILE_SIZE') {
+        res.status(413).json({
+          error: {
+            message: `Audio file too large: the maximum upload size is ${MAX_TRANSCRIPTION_BYTES / (1024 * 1024)} MB.`,
+            type: 'invalid_request_error',
+            code: 'file_too_large',
+          },
+        });
+        return;
+      }
+      transcriptionBadRequest(res, 'Malformed multipart/form-data upload.');
+      return;
+    }
+    next();
+  });
+}, async (req: Request, res: Response) => {
+  const file = req.file;
+  if (!file || !file.buffer?.length) {
+    transcriptionBadRequest(res, 'Invalid request: `file` is required (multipart/form-data audio upload).');
+    return;
+  }
+  const model = typeof req.body?.model === 'string' ? req.body.model.trim() : '';
+  if (!model) {
+    transcriptionBadRequest(res, "Invalid request: `model` is required (use 'whisper-1' or 'auto' to let the router decide).");
+    return;
+  }
+  const rawFormat = typeof req.body?.response_format === 'string' ? req.body.response_format.trim() : '';
+  const responseFormat = rawFormat || 'json';
+  if (!TRANSCRIPTION_FORMATS.has(responseFormat)) {
+    transcriptionBadRequest(res, `Invalid response_format '${responseFormat}'. Supported: json, text, verbose_json, vtt.`);
+    return;
+  }
+  if (responseFormat === 'srt') {
+    transcriptionBadRequest(
+      res,
+      "response_format 'srt' is not supported: no configured provider produces srt natively. Use json, text, verbose_json, or vtt.",
+      'unsupported_format',
+    );
+    return;
+  }
+  let temperature: number | undefined;
+  if (req.body?.temperature !== undefined && req.body.temperature !== '') {
+    temperature = Number(req.body.temperature);
+    if (!Number.isFinite(temperature) || temperature < 0 || temperature > 1) {
+      transcriptionBadRequest(res, 'Invalid temperature: must be a number between 0 and 1.');
+      return;
+    }
+  }
+  const language = typeof req.body?.language === 'string' && req.body.language.trim() ? req.body.language.trim() : undefined;
+  const prompt = typeof req.body?.prompt === 'string' && req.body.prompt ? req.body.prompt : undefined;
+
+  try {
+    const result = await runTranscription(model, {
+      file: file.buffer,
+      filename: file.originalname || 'audio',
+      mimeType: file.mimetype,
+      language,
+      prompt,
+      temperature,
+      responseFormat,
+    });
+    res.setHeader('X-Provider', safeHeaderValue(result.platform));
+    res.setHeader('X-Model', safeHeaderValue(result.modelId));
+    if (responseFormat === 'text') {
+      res.type('text/plain').send(result.text);
+      return;
+    }
+    if (responseFormat === 'vtt') {
+      res.type('text/vtt').send(result.vtt ?? '');
+      return;
+    }
+    if (responseFormat === 'verbose_json' && Array.isArray(result.segments) && result.segments.length > 0) {
+      res.json({
+        task: 'transcribe',
+        language: result.language ?? null,
+        duration: result.duration ?? null,
+        text: result.text,
+        segments: result.segments,
+      });
+      return;
+    }
+    res.json({ text: result.text });
+  } catch (err: any) {
+    const status = err instanceof MediaError ? err.status : 502;
+    const httpStatus = status >= 400 && status < 600 ? status : 502;
+    const code = err instanceof MediaError && err.code ? { code: err.code } : {};
+    res.status(httpStatus).json({ error: { message: `transcription error: ${err?.message ?? 'unknown'}`, type: mediaErrorType(status), ...code } });
   }
 });
 
@@ -654,6 +799,17 @@ proxyRouter.post('/completions', async (req: Request, res: Response) => {
   // exclude the whole model pool (#470); input is still counted in full.
   const estimatedTotal = estimatedInputTokens + routingReserveTokens(max_tokens);
 
+  // Guardrail: per-request token budget (request_max_tokens_budget, default
+  // off). max_tokens always has a value on this surface (default 128), so a
+  // violation can only reject — no capping branch.
+  const budgetCheck = applyTokenBudget(estimatedInputTokens, max_tokens);
+  if (budgetCheck.rejection) {
+    res.status(413).json({
+      error: { message: tokenBudgetMessage(budgetCheck.rejection), type: 'invalid_request_error', code: 'request_token_budget' },
+    });
+    return;
+  }
+
   let resolvedChain: ResolvedChain | undefined;
   if (isAutoModel(requestedModel)) {
     resolvedChain = resolveRoutingChain(requestedModel);
@@ -664,20 +820,33 @@ proxyRouter.post('/completions', async (req: Request, res: Response) => {
 
   if (!isAutoModel(requestedModel) && requestedModel) {
     const db = getDb();
-    const members = isUnifyEnabled() ? resolveRequestedIdToMembers(requestedModel, getModelGroups()) : null;
+    const resolved = isUnifyEnabled() ? resolveRequestedIdForDispatch(requestedModel, getModelGroups()) : null;
+    const members = resolved?.memberDbIds ?? null;
     if (members && members.length > 0) {
-      groupChain = resolveModelGroupCandidates(members);
+      groupChain = resolveModelGroupCandidates(members, resolved!.demotedDbIds);
       if (groupChain.length === 0) {
         const placeholders = members.map(() => '?').join(',');
         const anyEnabled = db.prepare(`SELECT 1 FROM models WHERE id IN (${placeholders}) AND enabled = 1 LIMIT 1`).get(...members);
-        const reason = anyEnabled ? 'has no providers with an enabled key' : 'is disabled';
-        res.status(400).json({
-          error: {
-            message: `Model '${requestedModel}' ${reason}. Use 'auto' (or omit the 'model' field) to auto-route, or call /v1/models for the available list.`,
-            type: 'invalid_request_error',
-            code: 'model_not_found',
-          },
-        });
+        // Honest statuses: a model whose providers exist but have no usable key
+        // is a server-side configuration gap (503), not a client mistake; a
+        // disabled/unknown model is a 404 model_not_found (OpenAI semantics).
+        if (anyEnabled) {
+          res.status(503).json({
+            error: {
+              message: `Model '${requestedModel}' has no providers with an enabled key. Add a provider API key for it, use 'auto' (or omit the 'model' field) to auto-route, or call /v1/models for the available list.`,
+              type: 'service_unavailable',
+              code: 'no_providers_configured',
+            },
+          });
+        } else {
+          res.status(404).json({
+            error: {
+              message: `Model '${requestedModel}' is disabled. Use 'auto' (or omit the 'model' field) to auto-route, or call /v1/models for the available list.`,
+              type: 'invalid_request_error',
+              code: 'model_not_found',
+            },
+          });
+        }
         return;
       }
     } else {
@@ -687,7 +856,7 @@ proxyRouter.post('/completions', async (req: Request, res: Response) => {
       } else {
         const disabled = db.prepare('SELECT id FROM models WHERE model_id = ?').get(requestedModel) as { id: number } | undefined;
         const reason = disabled ? 'is disabled' : 'is not in the catalog';
-        res.status(400).json({
+        res.status(404).json({
           error: {
             message: `Model '${requestedModel}' ${reason}. Use 'auto' (or omit the 'model' field) to auto-route, or call /v1/models for the available list.`,
             type: 'invalid_request_error',
@@ -701,6 +870,21 @@ proxyRouter.post('/completions', async (req: Request, res: Response) => {
 
   const pinnedModelId = requestedModel && !isAutoModel(requestedModel) ? requestedModel : null;
   const state = newFallbackState();
+  const attemptLog: AttemptRecord[] = [];
+  // Client-disconnect fan-out: the flag stops the loop before the NEXT
+  // attempt; the AbortController (threaded to the provider as
+  // CompletionOptions.signal) additionally cancels the IN-FLIGHT upstream
+  // fetch and any body/stream read, so tokens stop burning and the in-flight
+  // lease frees immediately. 'close' also fires on normal completion —
+  // writableEnded distinguishes a real disconnect.
+  let clientGone = false;
+  const clientAbort = new AbortController();
+  res.on('close', () => {
+    if (!res.writableEnded) {
+      clientGone = true;
+      clientAbort.abort(newClientAbortError());
+    }
+  });
 
   // Legacy /completions is a thin adapter over the shared fallback loop
   // (lib/fallback-loop.ts): the cooldown/skip/penalty/exhaustion machinery is
@@ -708,6 +892,8 @@ proxyRouter.post('/completions', async (req: Request, res: Response) => {
   await runFallbackLoop({
     maxRetries: MAX_RETRIES,
     state,
+    attemptLog,
+    clientGone: () => clientGone,
     route: () => routeRequest(
       estimatedTotal,
       state.skipKeys.size > 0 ? state.skipKeys : undefined,
@@ -741,8 +927,8 @@ proxyRouter.post('/completions', async (req: Request, res: Response) => {
           res.setHeader('Content-Type', 'text/event-stream');
           res.setHeader('Cache-Control', 'no-cache');
           res.setHeader('Connection', 'keep-alive');
-          res.setHeader('X-Routed-Via', `${route.platform}/${route.modelId}`);
-          if (attempt > 0) res.setHeader('X-Fallback-Attempts', String(attempt));
+          res.setHeader('X-Routed-Via', routedViaValue(route.platform, route.modelId));
+          setFallbackHeaders(res, attempt, attemptLog);
           headerSent = true;
           for (const frame of buffered) res.write(`data: ${JSON.stringify(frame)}\n\n`);
           buffered.length = 0;
@@ -753,11 +939,12 @@ proxyRouter.post('/completions', async (req: Request, res: Response) => {
             route.apiKey,
             messages,
             route.modelId,
-            { temperature, max_tokens, top_p, stop },
+            { temperature, max_tokens, top_p, stop, signal: clientAbort.signal },
             quotaContextForRoute(route, 'chat/completions'),
           );
 
           for await (const chunk of gen) {
+            if (clientGone) break; // client hung up: stop pulling; reader.cancel() aborts upstream
             const text = streamChunkText(chunk);
             if (text.length > 0) sawText = true;
             const finish = (chunk as any)?.choices?.[0]?.finish_reason;
@@ -772,6 +959,16 @@ proxyRouter.post('/completions', async (req: Request, res: Response) => {
             }
             flushHeaders();
             res.write(`data: ${JSON.stringify(frame)}\n\n`);
+          }
+
+          // Disconnect before the commit point: the break above fired with no
+          // text seen, which is indistinguishable from an empty completion
+          // below — but it is CLIENT behavior, not a provider failure. Without
+          // this check every Ctrl-C during a reasoning model's TTFB window
+          // benched the healthy model+key for 90s and logged a provider error.
+          if (clientGone && !headerSent && !sawText) {
+            console.log(`[Proxy] client disconnected before first token from ${route.displayName} — dropping attempt without benching`);
+            return 'committed';
           }
 
           if (!sawText) {
@@ -802,6 +999,12 @@ proxyRouter.post('/completions', async (req: Request, res: Response) => {
           logRequest(route.platform, route.modelId, route.keyId, 'success', estimatedInputTokens, totalOutputTokens, Date.now() - start, null, ttfbMs, pinnedModelId);
           return 'done';
         } catch (streamErr: any) {
+          // Client abort mid-stream: the pump's own `if (clientGone) break`
+          // can lose the race against the fetch-signal rejection, so the
+          // abort may surface here instead. Rethrow — the shared loop's
+          // client-abort branch stops the ladder without benching or an
+          // error log row (the socket is gone; nothing to render).
+          if (isClientAbortError(streamErr)) throw streamErr;
           if (headerSent) {
             console.error(`[Proxy] Mid-stream legacy completion error from ${route.displayName}:`, streamErr.message);
             const payload = { error: { message: `Provider error (${route.displayName}): stream interrupted`, type: 'stream_error' } };
@@ -827,7 +1030,7 @@ proxyRouter.post('/completions', async (req: Request, res: Response) => {
         route.apiKey,
         messages,
         route.modelId,
-        { temperature, max_tokens, top_p, stop },
+        { temperature, max_tokens, top_p, stop, signal: clientAbort.signal },
         quotaContextForRoute(route, 'chat/completions'),
       );
 
@@ -849,8 +1052,8 @@ proxyRouter.post('/completions', async (req: Request, res: Response) => {
       const totalTokens = result.usage?.total_tokens ?? (promptTokens + completionTokens);
       recordUpstreamSuccess(route, totalTokens);
 
-      res.setHeader('X-Routed-Via', `${route.platform}/${route.modelId}`);
-      if (attempt > 0) res.setHeader('X-Fallback-Attempts', String(attempt));
+      res.setHeader('X-Routed-Via', routedViaValue(route.platform, route.modelId));
+      setFallbackHeaders(res, attempt, attemptLog);
       res.json({
         id: completionIdFromChat(result.id),
         object: 'text_completion',
@@ -893,7 +1096,7 @@ proxyRouter.post('/completions', async (req: Request, res: Response) => {
       logRequest(route.platform, route.modelId, route.keyId, 'error', estimatedInputTokens, 0, latency, safeError, null, pinnedModelId);
     },
     onFatal: (route, err, attempt) => {
-      if (attempt > 0) res.setHeader('X-Fallback-Attempts', String(attempt));
+      setFallbackHeaders(res, attempt, attemptLog);
       res.status(502).json({
         error: {
           message: `Provider error (${route.displayName}): ${sanitizeProviderErrorMessage(err.message)}`,
@@ -902,22 +1105,24 @@ proxyRouter.post('/completions', async (req: Request, res: Response) => {
       });
     },
     onRoutingExhausted: (lastError, routeErr, exhaustion, info) => {
-      if (exhaustion) {
-        if (info.attempts.length > 0) res.setHeader('X-Fallback-Attempts', String(info.attempts.length));
-        res.status(exhaustion.status).json({ error: { message: exhaustion.message, type: exhaustion.type } });
-      } else {
+      if (!lastError) {
+        // Synchronous exhaustion: the router rejected every candidate before
+        // any upstream was tried — log the per-candidate disposition.
         const disposition: string[] = Array.isArray(routeErr.diagnostics) ? routeErr.diagnostics : [];
         console.warn(
           `[Proxy] legacy completions routing exhausted (no upstream tried) req=${shortRequestId(requestGroupId)} ` +
           `requested=${requestedModelLabel} candidates=${disposition.length}` +
           (disposition.length ? `:\n  ${disposition.join('\n  ')}` : ''),
         );
-        res.status(routeErr.status ?? 503).json({ error: { message: routeErr.message, type: 'routing_error' } });
       }
+      setFallbackHeaders(res, info.attempts.length, info.attempts);
+      setExhaustionHeaders(res, exhaustion);
+      res.status(exhaustion.status).json({ error: exhaustionErrorPayload(exhaustion) });
     },
     onExhausted: (exhaustion, info) => {
-      if (info.attempts.length > 0) res.setHeader('X-Fallback-Attempts', String(info.attempts.length));
-      res.status(exhaustion.status).json({ error: { message: exhaustion.message, type: exhaustion.type } });
+      setFallbackHeaders(res, info.attempts.length, info.attempts);
+      setExhaustionHeaders(res, exhaustion);
+      res.status(exhaustion.status).json({ error: exhaustionErrorPayload(exhaustion) });
     },
   });
 });
@@ -964,8 +1169,16 @@ proxyRouter.post('/chat/completions', async (req: Request, res: Response) => {
   // Agent-tolerant knob normalization (#200): max_tokens <= 0 means "no
   // limit" in several clients → unset; tool_choice 'any' is OpenAI's
   // 'required'; tool definitions get their 'function' type re-defaulted.
-  const max_tokens = parsed.data.max_tokens != null && parsed.data.max_tokens > 0
-    ? parsed.data.max_tokens : undefined;
+  // `max_completion_tokens` is OpenAI's newer alias — honored when max_tokens
+  // itself is absent. `let`: the token-budget guardrail below may cap an
+  // absent max_tokens to the budget remainder before the options objects are
+  // built from it.
+  const requestedMaxTokens = parsed.data.max_tokens ?? parsed.data.max_completion_tokens;
+  let max_tokens = requestedMaxTokens != null && requestedMaxTokens > 0
+    ? requestedMaxTokens : undefined;
+  // Extended sampling/output params (seed, penalties, response_format…),
+  // spread into every options object below — including fusion fan-out.
+  const samplingParams = pickSamplingParams(parsed.data);
   const stop = providerSafeStop(parsed.data.stop);
   const tool_choice = parsed.data.tool_choice === 'any' ? 'required' as const : parsed.data.tool_choice ?? undefined;
   const tools = parsed.data.tools?.map(t => ({ ...t, type: 'function' as const }));
@@ -986,7 +1199,7 @@ proxyRouter.post('/chat/completions', async (req: Request, res: Response) => {
     return pendingToolCallIds.shift() ?? `call_auto_${++syntheticIdCounter}`;
   };
 
-  const messages: ChatMessage[] = parsed.data.messages.map((m): ChatMessage => {
+  let messages: ChatMessage[] = parsed.data.messages.map((m): ChatMessage => {
     if (m.role === 'assistant') {
       const hasToolCalls = (m.tool_calls?.length ?? 0) > 0;
       // With tool_calls, content: null is the correct OpenAI shape — keep it.
@@ -1058,6 +1271,24 @@ proxyRouter.post('/chat/completions', async (req: Request, res: Response) => {
     };
   });
 
+  let cacheControlPrefixLength = 0;
+  parsed.data.messages.forEach((message, index) => {
+    const content = message.content;
+    if (
+      Array.isArray(content)
+      && content.some(block => block && typeof block === 'object' && 'cache_control' in block)
+    ) {
+      cacheControlPrefixLength = index + 1;
+    }
+  });
+  const compressionResult = compressRequest(messages, {
+    header: req.headers['x-freellm-compress'],
+    tools,
+    cacheControlPrefixLength,
+  });
+  messages = compressionResult.messages;
+  res.setHeader('X-FreeLLM-Compress', formatCompressionHeader(compressionResult));
+
   // Token estimation is intentionally a heuristic (~4 chars per token). Used
   // for routing decisions (skip a model whose budget is too small) and for
   // streaming bookkeeping where the provider doesn't echo a final usage count.
@@ -1109,6 +1340,20 @@ proxyRouter.post('/chat/completions', async (req: Request, res: Response) => {
     return;
   }
 
+  // Guardrail: per-request token budget (request_max_tokens_budget, default
+  // off). Estimated input (incl. images) + requested output must fit the
+  // ceiling; a request with no max_tokens gets its output capped to the
+  // remainder instead. Sits before the Fusion branch so fan-out inherits the
+  // capped max_tokens too.
+  const budgetCheck = applyTokenBudget(estimatedInputTokens + imageCount * IMAGE_TOKEN_ESTIMATE, max_tokens);
+  if (budgetCheck.rejection) {
+    res.status(413).json({
+      error: { message: tokenBudgetMessage(budgetCheck.rejection), type: 'invalid_request_error', code: 'request_token_budget' },
+    });
+    return;
+  }
+  max_tokens = budgetCheck.maxTokens;
+
   // ── Fusion: multi-model synthesis ──────────────────────────────────────────
   // The virtual "fusion" model fans the prompt out to a panel of diverse models
   // in parallel, then a judge synthesizes one answer. It routes each panel/judge
@@ -1121,7 +1366,7 @@ proxyRouter.post('/chat/completions', async (req: Request, res: Response) => {
       res.status(422).json({ error: { message: 'Fusion does not support image input yet. Use a vision model directly.', type: 'invalid_request_error', code: 'fusion_no_vision' } });
       return;
     }
-    const fusionOptions = { temperature, max_tokens, top_p, stop, tools, tool_choice, parallel_tool_calls };
+    const fusionOptions = { temperature, max_tokens, top_p, stop, tools, tool_choice, parallel_tool_calls, ...samplingParams };
     const fusionConfig = parsed.data.fusion ?? {};
 
     if (stream) {
@@ -1198,7 +1443,25 @@ proxyRouter.post('/chat/completions', async (req: Request, res: Response) => {
         options: fusionOptions,
         estimatedTokens: estimatedTotal,
       });
-      res.setHeader('X-Routed-Via', routedVia);
+      // Structured-output enforcement for fusion (#516 scope gap): the panel/
+      // judge output got no format check, so model:"fusion" could hand back
+      // prose as a "success" for a json_schema request. Fusion has no failover
+      // machinery to hand this to — heal what's healable, otherwise answer
+      // honestly instead of pretending. (Streaming fusion stays unenforced,
+      // same boundary as every other streamed response.)
+      const fusionMsg = (response as any)?.choices?.[0]?.message;
+      if (samplingParams.response_format && fusionMsg && !fusionMsg.tool_calls?.length) {
+        const fusionText = contentToString(fusionMsg.content ?? '');
+        if (fusionText) {
+          const enforced = enforceJsonContent(fusionText);
+          if (!enforced.ok) {
+            res.status(502).json({ error: { message: `fusion produced non-JSON output despite response_format=${samplingParams.response_format.type} — retry, or pin a structured-output-capable model instead of "fusion"`, type: 'server_error' } });
+            return;
+          }
+          if (enforced.healed) fusionMsg.content = enforced.content;
+        }
+      }
+      res.setHeader('X-Routed-Via', safeHeaderValue(routedVia));
       res.json(response);
     } catch (err: any) {
       if (err instanceof FusionError) {
@@ -1238,6 +1501,10 @@ proxyRouter.post('/chat/completions', async (req: Request, res: Response) => {
         logit_bias: req.body?.logit_bias ?? undefined,
         logprobs: req.body?.logprobs ?? undefined,
         top_logprobs: req.body?.top_logprobs ?? undefined,
+        // Normalized reasoning knob (flat field or object form) — a different
+        // effort asks for a different answer, so it must never collide.
+        reasoning_effort: samplingParams.reasoning_effort ?? undefined,
+        compression: compressionResult.cacheKey,
       })
     : null;
   if (cacheKey) {
@@ -1297,29 +1564,40 @@ proxyRouter.post('/chat/completions', async (req: Request, res: Response) => {
   let stickyStrategyKey: string | undefined = strategyKey;
 
   if (isAutoModel(requestedModel)) {
-    preferredModel = getStickyModel(messages, sessionIdHeader, strategyKey);
+    preferredModel = resolveStickyPreference(getStickyModel(messages, sessionIdHeader, strategyKey), resolvedChain?.chain);
   } else if (requestedModel) {
     const db = getDb();
     // Unify ON: a requested id (canonical slug OR any provider's model_id) maps
     // to the whole logical-model group, and we route STRICTLY across only its
     // providers — failing over between them, never to a different model (#335).
-    const members = isUnifyEnabled() ? resolveRequestedIdToMembers(requestedModel, getModelGroups()) : null;
+    const resolved = isUnifyEnabled() ? resolveRequestedIdForDispatch(requestedModel, getModelGroups()) : null;
+    const members = resolved?.memberDbIds ?? null;
     if (members && members.length > 0) {
-      groupChain = resolveModelGroupCandidates(members);
+      groupChain = resolveModelGroupCandidates(members, resolved!.demotedDbIds);
       if (groupChain.length === 0) {
-        // Distinguish a catalog-disabled model from one whose providers are
-        // present but unusable (chain-disabled / no key), so the 400 stays
-        // actionable and matches the legacy single-row "is disabled" wording.
+        // Distinguish a catalog-disabled model (404 model_not_found, OpenAI
+        // semantics) from one whose providers are present but unusable
+        // (chain-disabled / no key) — the latter is a server-side
+        // configuration gap, so it renders an honest 503.
         const placeholders = members.map(() => '?').join(',');
         const anyEnabled = db.prepare(`SELECT 1 FROM models WHERE id IN (${placeholders}) AND enabled = 1 LIMIT 1`).get(...members);
-        const reason = anyEnabled ? 'has no providers with an enabled key' : 'is disabled';
-        res.status(400).json({
-          error: {
-            message: `Model '${requestedModel}' ${reason}. Use 'auto' (or omit the 'model' field) to auto-route, or call /v1/models for the available list.`,
-            type: 'invalid_request_error',
-            code: 'model_not_found',
-          },
-        });
+        if (anyEnabled) {
+          res.status(503).json({
+            error: {
+              message: `Model '${requestedModel}' has no providers with an enabled key. Add a provider API key for it, use 'auto' (or omit the 'model' field) to auto-route, or call /v1/models for the available list.`,
+              type: 'service_unavailable',
+              code: 'no_providers_configured',
+            },
+          });
+        } else {
+          res.status(404).json({
+            error: {
+              message: `Model '${requestedModel}' is disabled. Use 'auto' (or omit the 'model' field) to auto-route, or call /v1/models for the available list.`,
+              type: 'invalid_request_error',
+              code: 'model_not_found',
+            },
+          });
+        }
         return;
       }
       stickyStrategyKey = requestedModel;
@@ -1336,7 +1614,7 @@ proxyRouter.post('/chat/completions', async (req: Request, res: Response) => {
       } else {
         const disabled = db.prepare('SELECT id FROM models WHERE model_id = ?').get(requestedModel) as { id: number } | undefined;
         const reason = disabled ? 'is disabled' : 'is not in the catalog';
-        res.status(400).json({
+        res.status(404).json({
           error: {
             message: `Model '${requestedModel}' ${reason}. Use 'auto' (or omit the 'model' field) to auto-route, or call /v1/models for the available list.`,
             type: 'invalid_request_error',
@@ -1347,7 +1625,7 @@ proxyRouter.post('/chat/completions', async (req: Request, res: Response) => {
       }
     }
   } else {
-    preferredModel = getStickyModel(messages, sessionIdHeader, strategyKey);
+    preferredModel = resolveStickyPreference(getStickyModel(messages, sessionIdHeader, strategyKey), resolvedChain?.chain);
   }
 
   // For analytics: the model id the client pinned, null when auto-routed
@@ -1362,10 +1640,27 @@ proxyRouter.post('/chat/completions', async (req: Request, res: Response) => {
   // context-handoff injection, group/unified-chain routing, and the OpenAI
   // stream turn-integrity framing.
   const state = newFallbackState();
+  const attemptLog: AttemptRecord[] = [];
+  // Client-disconnect fan-out: the flag stops the loop before the NEXT
+  // attempt; the AbortController (threaded to the provider as
+  // CompletionOptions.signal) additionally cancels the IN-FLIGHT upstream
+  // fetch and any body/stream read, so tokens stop burning and the in-flight
+  // lease frees immediately. 'close' also fires on normal completion —
+  // writableEnded distinguishes a real disconnect.
+  let clientGone = false;
+  const clientAbort = new AbortController();
+  res.on('close', () => {
+    if (!res.writableEnded) {
+      clientGone = true;
+      clientAbort.abort(newClientAbortError());
+    }
+  });
 
   await runFallbackLoop({
     maxRetries: MAX_RETRIES,
     state,
+    attemptLog,
+    clientGone: () => clientGone,
     route: () => {
       // When a handoff could fire this turn, pad the token estimate so the router's
       // context-window and TPM checks account for the extra system message overhead.
@@ -1374,7 +1669,7 @@ proxyRouter.post('/chat/completions', async (req: Request, res: Response) => {
       // model is on record). Turns where injection can't happen — every turn 1, and
       // sessions that never switched — pay no headroom tax.
       const routingEstimate = handoffPossible ? estimatedTotal + HANDOFF_MAX_TOKENS : estimatedTotal;
-      return routeRequest(routingEstimate, state.skipKeys.size > 0 ? state.skipKeys : undefined, preferredModel, hasImage, wantsTools, state.skipModels.size > 0 ? state.skipModels : undefined, groupChain ?? resolvedChain?.chain);
+      return routeRequest(routingEstimate, state.skipKeys.size > 0 ? state.skipKeys : undefined, preferredModel, hasImage, wantsTools, state.skipModels.size > 0 ? state.skipModels : undefined, groupChain ?? resolvedChain?.chain, samplingParams.response_format !== undefined);
     },
     dispatch: async (route, attempt) => {
     const modelKey = `${route.platform}:${route.modelId}`;
@@ -1430,6 +1725,11 @@ proxyRouter.post('/chat/completions', async (req: Request, res: Response) => {
         let upstreamFinish: string | null = null;
         let usageChunk: unknown = null;
         let lastMeta: { id?: string; model?: string; created?: number } = {};
+        // Raw upstream-reported model, captured off the first frame that
+        // carries one — BEFORE the per-frame overwrite below destroys it.
+        // Only evidence when a provider serves a different model than routed
+        // (#534); compared/persisted on success via observeServedModel.
+        let upstreamModel: string | null = null;
 
         const flushHeaders = () => {
           if (headerSent) return;
@@ -1437,8 +1737,8 @@ proxyRouter.post('/chat/completions', async (req: Request, res: Response) => {
           res.setHeader('Content-Type', 'text/event-stream');
           res.setHeader('Cache-Control', 'no-cache');
           res.setHeader('Connection', 'keep-alive');
-          res.setHeader('X-Routed-Via', `${route.platform}/${route.modelId}`);
-          if (attempt > 0) res.setHeader('X-Fallback-Attempts', String(attempt));
+          res.setHeader('X-Routed-Via', routedViaValue(route.platform, route.modelId));
+          setFallbackHeaders(res, attempt, attemptLog);
           headerSent = true;
           for (const p of preamble) res.write(`data: ${JSON.stringify(p)}\n\n`);
           preamble.length = 0;
@@ -1455,12 +1755,22 @@ proxyRouter.post('/chat/completions', async (req: Request, res: Response) => {
         try {
           const gen = route.provider.streamChatCompletion(
             route.apiKey, outboundMessages, route.modelId,
-            { temperature, max_tokens, top_p, stop, tools, tool_choice, parallel_tool_calls },
+            { temperature, max_tokens, top_p, stop, tools, tool_choice, parallel_tool_calls, ...samplingParams, signal: clientAbort.signal },
             quotaContextForRoute(route, 'chat/completions'),
           );
 
           for await (const chunk of gen) {
-            const anyChunk = chunk as Record<string, any>;
+            if (clientGone) break; // client hung up: stop pulling; reader.cancel() aborts upstream
+            // Provider metadata is not authoritative for the public gateway
+            // response. Some OpenAI-compatible providers (notably Reka) return
+            // the literal model name "default" even when a concrete model was
+            // requested. Normalize every streamed frame at the proxy boundary
+            // so clients consistently see the model that was actually routed.
+            const rawChunkModel = (chunk as Record<string, any>).model;
+            if (upstreamModel == null && typeof rawChunkModel === 'string' && rawChunkModel.length > 0) {
+              upstreamModel = rawChunkModel;
+            }
+            const anyChunk: Record<string, any> = { ...(chunk as Record<string, any>), model: route.modelId };
 
             // In-band upstream error frame (observed live: Groq emits
             // {"error":{...,"code":"tool_use_failed"}} inside a 200 SSE
@@ -1508,8 +1818,8 @@ proxyRouter.post('/chat/completions', async (req: Request, res: Response) => {
               if (tc.function?.arguments) acc.args += tc.function.arguments;
             }
 
-            normalizeOutboundContent(chunk);
-            sanitizeResponse(chunk);
+            normalizeOutboundContent(anyChunk);
+            sanitizeResponse(anyChunk);
             const text = typeof choice.delta?.content === 'string' ? choice.delta.content : '';
 
             if (text.length === 0) {
@@ -1580,6 +1890,17 @@ proxyRouter.post('/chat/completions', async (req: Request, res: Response) => {
             }
           }
 
+          // Disconnect before the commit point: nothing usable was (or will
+          // be) delivered, and that is CLIENT behavior, not a provider
+          // failure — do not let it fall through to the empty-completion
+          // throw below, which would bench a healthy model+key for 90s and
+          // log a provider error for every Ctrl-C during a reasoning model's
+          // TTFB window.
+          if (clientGone && !headerSent && heldText.trim().length === 0 && completedCalls.length === 0) {
+            console.log(`[Proxy] client disconnected before first token from ${route.displayName} — dropping attempt without benching`);
+            return 'committed';
+          }
+
           const hasText = headerSent || heldText.trim().length > 0;
           if (!hasText && completedCalls.length === 0) {
             // Nothing usable came out — same failover semantics as the
@@ -1626,9 +1947,16 @@ proxyRouter.post('/chat/completions', async (req: Request, res: Response) => {
             inputTokens: estimatedInputTokens + injectedHandoffTokens,
             outputTokens: totalOutputTokens,
           });
-          logRequest(route.platform, route.modelId, route.keyId, 'success', estimatedInputTokens + injectedHandoffTokens, totalOutputTokens, Date.now() - start, null, ttfbMs, pinnedModelId);
+          logRequest(route.platform, route.modelId, route.keyId, 'success', estimatedInputTokens + injectedHandoffTokens, totalOutputTokens, Date.now() - start, null, ttfbMs, pinnedModelId,
+            observeServedModel({ platform: route.platform, requestedModel: route.modelId, servedModel: upstreamModel }));
           return 'done';
         } catch (streamErr: any) {
+          // Client abort mid-stream: the pump's own `if (clientGone) break`
+          // can lose the race against the fetch-signal rejection, so the
+          // abort may surface here instead. Rethrow — the shared loop's
+          // client-abort branch stops the ladder without benching or an
+          // error log row (the socket is gone; nothing to render).
+          if (isClientAbortError(streamErr)) throw streamErr;
           if (headerSent) {
             // Mid-stream error after real payload reached the client — finish
             // the SSE response honestly instead of leaving the client hanging.
@@ -1657,9 +1985,22 @@ proxyRouter.post('/chat/completions', async (req: Request, res: Response) => {
       } else {
         const result = await route.provider.chatCompletion(
           route.apiKey, outboundMessages, route.modelId,
-          { temperature, max_tokens, top_p, stop, tools, tool_choice, parallel_tool_calls },
+          { temperature, max_tokens, top_p, stop, tools, tool_choice, parallel_tool_calls, ...samplingParams, signal: clientAbort.signal },
           quotaContextForRoute(route, 'chat/completions'),
         );
+
+        // Raw upstream-reported model, captured BEFORE the contract overwrite
+        // below destroys it — the only evidence when a provider silently
+        // serves a different model than requested (#534). The OpenAI-compat,
+        // cohere, and cloudflare adapters pass the upstream body through, so
+        // result.model here is still the provider's own claim; google/aihorde
+        // synthesize their responses with the routed id (no upstream signal).
+        const upstreamModel = typeof result.model === 'string' ? result.model : null;
+
+        // Upstream `model` fields are provider-controlled and can be a generic
+        // placeholder such as Reka's "default". The gateway contract exposes
+        // the concrete routed model, consistently across every provider.
+        result.model = route.modelId;
 
         // Empty completion (no text, no tool calls) → fail over rather than
         // return a transport-level "success" the caller can't act on. Mirrors
@@ -1703,6 +2044,35 @@ proxyRouter.post('/chat/completions', async (req: Request, res: Response) => {
           }
         }
 
+        // Structured-output enforcement (#514 follow-up): the client asked for
+        // JSON; a model that answered in prose despite the forwarded
+        // response_format must not be returned as a "success". Heal the common
+        // almost-right shapes (fenced block, prose-wrapped JSON) in place;
+        // otherwise fail over. Deliberately AFTER the dialect rescue (matching
+        // responses.ts): an inline tool-call turn isn't JSON either, and
+        // gating it first burned a failover hop on turns the rescue converts.
+        // skipBench: the provider is healthy — the MODEL misbehaved — so no
+        // cooldown/penalty; skipModelForRequest: a sibling key would misbehave
+        // identically, so rule out the whole model for this request.
+        if (samplingParams.response_format && respText && (respMsg?.tool_calls?.length ?? 0) === 0) {
+          const enforced = enforceJsonContent(respText);
+          if (!enforced.ok) {
+            // finish_reason 'length' = the JSON was CUT OFF by max_tokens, not
+            // ignored — same failover (a terser model may fit the budget), but
+            // an honest error class/trail instead of "ignored response_format".
+            const truncated = result.choices?.[0]?.finish_reason === 'length';
+            throw Object.assign(
+              new Error(truncated
+                ? `truncated JSON from ${route.displayName} (finish_reason=length — raise max_tokens for this ${samplingParams.response_format.type} request)`
+                : `${route.displayName} ignored response_format (returned non-JSON despite ${samplingParams.response_format.type})`),
+              { skipBench: true, skipModelForRequest: true },
+            );
+          }
+          if (enforced.healed && respMsg) {
+            respMsg.content = enforced.content;
+          }
+        }
+
         // Usage fallback: providers that omit `usage` used to be logged as 0
         // tokens, silently undercounting analytics and the rate-limit ledger.
         // Fall back to the same chars/4 estimate the streaming path uses (tool
@@ -1721,8 +2091,8 @@ proxyRouter.post('/chat/completions', async (req: Request, res: Response) => {
         setStickyModel(messages, route.modelDbId, sessionIdHeader, stickyStrategyKey);
         if (handoffMode !== 'off' && sessionKey) recordSuccessfulModel({ sessionKey, modelKey });
 
-        res.setHeader('X-Routed-Via', `${route.platform}/${route.modelId}`);
-        if (attempt > 0) res.setHeader('X-Fallback-Attempts', String(attempt));
+        res.setHeader('X-Routed-Via', routedViaValue(route.platform, route.modelId));
+        setFallbackHeaders(res, attempt, attemptLog);
         // Repair double-encoded tool arguments against the request's tool
         // schemas (e.g. GLM emitting an array parameter as a JSON string),
         // so strict clients don't reject the call. Schema-gated — a true
@@ -1765,7 +2135,8 @@ proxyRouter.post('/chat/completions', async (req: Request, res: Response) => {
           inputTokens: promptTokens,
           outputTokens: completionTokens,
         });
-        logRequest(route.platform, route.modelId, route.keyId, 'success', promptTokens, completionTokens, Date.now() - start, null, null, pinnedModelId);
+        logRequest(route.platform, route.modelId, route.keyId, 'success', promptTokens, completionTokens, Date.now() - start, null, null, pinnedModelId,
+          observeServedModel({ platform: route.platform, requestedModel: route.modelId, servedModel: upstreamModel }));
         return 'done';
       }
     },
@@ -1785,7 +2156,7 @@ proxyRouter.post('/chat/completions', async (req: Request, res: Response) => {
     },
     onFatal: (route, err, attempt) => {
       // Non-retryable error (bare 4xx, etc.): don't retry.
-      if (attempt > 0) res.setHeader('X-Fallback-Attempts', String(attempt));
+      setFallbackHeaders(res, attempt, attemptLog);
       res.status(502).json({
         error: {
           message: `Provider error (${route.displayName}): ${sanitizeProviderErrorMessage(err.message)}`,
@@ -1795,26 +2166,26 @@ proxyRouter.post('/chat/completions', async (req: Request, res: Response) => {
     },
     onRoutingExhausted: (lastError, routeErr, exhaustion, info) => {
       // No more models available.
-      if (exhaustion) {
-        if (info.attempts.length > 0) res.setHeader('X-Fallback-Attempts', String(info.attempts.length));
-        res.status(exhaustion.status).json({ error: { message: exhaustion.message, type: exhaustion.type } });
-      } else {
+      if (!lastError) {
         // Synchronous exhaustion: the router rejected every candidate before any
         // upstream was tried, so this is the ONLY place the per-model disposition
-        // is recorded. Without it a routing_error 429 is opaque — you can't tell a
-        // genuinely dry pool from cooldowns/quota/context narrowing (issue _1).
+        // is recorded. Without it the exhaustion status is opaque — you can't tell
+        // a genuinely dry pool from cooldowns/quota/context narrowing (issue _1).
         const disposition: string[] = Array.isArray(routeErr.diagnostics) ? routeErr.diagnostics : [];
         console.warn(
           `[Proxy] routing exhausted (no upstream tried) req=${shortRequestId(requestGroupId)} ` +
           `requested=${requestedModelLabel} candidates=${disposition.length}` +
           (disposition.length ? `:\n  ${disposition.join('\n  ')}` : ''),
         );
-        res.status(routeErr.status ?? 503).json({ error: { message: routeErr.message, type: 'routing_error' } });
       }
+      setFallbackHeaders(res, info.attempts.length, info.attempts);
+      setExhaustionHeaders(res, exhaustion);
+      res.status(exhaustion.status).json({ error: exhaustionErrorPayload(exhaustion) });
     },
     onExhausted: (exhaustion, info) => {
-      if (info.attempts.length > 0) res.setHeader('X-Fallback-Attempts', String(info.attempts.length));
-      res.status(exhaustion.status).json({ error: { message: exhaustion.message, type: exhaustion.type } });
+      setFallbackHeaders(res, info.attempts.length, info.attempts);
+      setExhaustionHeaders(res, exhaustion);
+      res.status(exhaustion.status).json({ error: exhaustionErrorPayload(exhaustion) });
     },
   });
 });

@@ -9,8 +9,9 @@ import type {
   ChatToolChoice,
   Platform,
 } from '@freellmapi/shared/types.js';
-import { routeRequest, hasEnabledToolsModel, routingReserveTokens, type RouteResult } from '../services/router.js';
-import { getUnifiedApiKey } from '../db/index.js';
+import { routeRequest, hasEnabledToolsModel, resolveStickyPreference, routingReserveTokens, resolveModelGroupCandidates, type RouteResult, type ChainRow } from '../services/router.js';
+import { getDb, getUnifiedApiKey } from '../db/index.js';
+import { isUnifyEnabled, getModelGroups, resolveRequestedIdForDispatch } from '../services/model-groups.js';
 import { contentToString } from '../lib/content.js';
 import { repairToolArguments, toolSchemaMap } from '../lib/tool-args.js';
 import { rescueInlineToolCalls, startsWithDialectMarker, couldBecomeDialectMarker, containsDialectMarker } from '../lib/tool-call-rescue.js';
@@ -23,11 +24,25 @@ import {
   traceRouteEvent,
   logRequest,
 } from './proxy.js';
-import { runFallbackLoop, newFallbackState, recordUpstreamSuccess } from '../lib/fallback-loop.js';
+import { runFallbackLoop, newFallbackState, recordUpstreamSuccess, setFallbackHeaders, exhaustionErrorPayload, setExhaustionHeaders, type AttemptRecord } from '../lib/fallback-loop.js';
+import { routedViaValue } from '../lib/header-value.js';
+import { applyTokenBudget, tokenBudgetMessage } from '../lib/guardrails.js';
+import { samplingParamSchemaFields, pickSamplingParams, type ResponseFormat } from '../lib/sampling-params.js';
+import { enforceJsonContent } from '../lib/structured-output.js';
 import { sanitizeProviderErrorMessage } from '../lib/error-redaction.js';
+import { isClientAbortError, newClientAbortError } from '../lib/error-classify.js';
 import { inferQuotaPoolKey, type QuotaObservationContext } from '../services/provider-quota.js';
+import { compressRequest, formatCompressionHeader } from '../services/compression/pipeline.js';
 
 export const responsesRouter = Router();
+
+const AUTO_MODEL_ID = 'auto';
+
+function isAutoModel(modelId: string | undefined): boolean {
+  if (!modelId) return true;
+  const lower = modelId.toLowerCase();
+  return lower === AUTO_MODEL_ID || lower.startsWith(`${AUTO_MODEL_ID}:`);
+}
 
 // ─────────────────────────────────────────────────────────────────────────
 // OpenAI Responses API shim (POST /v1/responses).
@@ -118,6 +133,18 @@ const responsesRequestSchema = z.object({
     z.object({ type: z.literal('function'), name: z.string() }).passthrough(),
   ]).optional(),
   parallel_tool_calls: z.boolean().nullable().optional(),
+  // Extended sampling params, validated the same way as /chat/completions.
+  // Responses clients express structured output as `text.format` rather than
+  // `response_format` — mapped where completionOpts is built.
+  ...samplingParamSchemaFields,
+  text: z.object({
+    format: z.object({
+      type: z.enum(['text', 'json_object', 'json_schema']),
+      name: z.string().optional(),
+      strict: z.boolean().nullable().optional(),
+      schema: z.record(z.string(), z.unknown()).optional(),
+    }).passthrough().optional(),
+  }).passthrough().nullable().optional(),
 }).passthrough();
 
 type ResponsesRequest = z.infer<typeof responsesRequestSchema>;
@@ -320,12 +347,23 @@ responsesRouter.post('/responses', async (req: Request, res: Response) => {
   }
 
   const stream = reqData.stream ?? false;
-  const messages = toChatMessages(reqData);
+  let messages = toChatMessages(reqData);
   const tools = toChatTools(reqData.tools);
   // name → parameter schema, for repairing double-encoded tool arguments on
   // the way back out (see lib/tool-args.ts).
   const toolSchemas = toolSchemaMap(tools);
   const tool_choice = tools?.length ? toChatToolChoice(reqData.tool_choice) : undefined;
+  // Responses-API structured output arrives as `text.format`; translate it to
+  // the internal response_format shape (an explicit response_format on the
+  // body, unusual for this surface but valid, wins).
+  const samplingParams = pickSamplingParams(reqData);
+  const textFormat = reqData.text?.format;
+  if (!samplingParams.response_format && textFormat && textFormat.type !== 'text') {
+    samplingParams.response_format = textFormat.type === 'json_schema'
+      ? { type: 'json_schema', json_schema: { name: textFormat.name, strict: textFormat.strict, schema: textFormat.schema } }
+      : { type: 'json_object' } as ResponseFormat;
+  }
+
   const completionOpts = {
     temperature: reqData.temperature ?? undefined,
     max_tokens: reqData.max_output_tokens ?? undefined,
@@ -333,7 +371,21 @@ responsesRouter.post('/responses', async (req: Request, res: Response) => {
     tools,
     tool_choice,
     parallel_tool_calls: reqData.parallel_tool_calls ?? undefined,
+    ...samplingParams,
   };
+
+  const hasCacheControl = typeof reqData.input !== 'string' && reqData.input.some(item => {
+    const content = (item as { content?: unknown }).content;
+    return Array.isArray(content)
+      && content.some(block => block && typeof block === 'object' && 'cache_control' in block);
+  });
+  const compressionResult = compressRequest(messages, {
+    header: req.headers['x-freellm-compress'],
+    tools,
+    cacheControlPrefixLength: hasCacheControl ? messages.length : 0,
+  });
+  messages = compressionResult.messages;
+  res.setHeader('X-FreeLLM-Compress', formatCompressionHeader(compressionResult));
 
   const estimatedInputTokens = messages.reduce(
     (sum, m) => sum + Math.ceil(contentToString(m.content).length / 4),
@@ -342,11 +394,73 @@ responsesRouter.post('/responses', async (req: Request, res: Response) => {
   // Capped output reserve so a large max_output_tokens can't falsely exclude the
   // model pool (#470); input counts in full.
   const estimatedTotal = estimatedInputTokens + routingReserveTokens(reqData.max_output_tokens);
+
+  // Guardrail: per-request token budget (request_max_tokens_budget, default
+  // off). A request with no max_output_tokens gets its output capped to the
+  // budget remainder instead of a rejection.
+  const budgetCheck = applyTokenBudget(estimatedInputTokens, completionOpts.max_tokens);
+  if (budgetCheck.rejection) {
+    res.status(413).json({
+      error: { message: tokenBudgetMessage(budgetCheck.rejection), type: 'invalid_request_error', code: 'request_token_budget' },
+    });
+    return;
+  }
+  completionOpts.max_tokens = budgetCheck.maxTokens;
   // Optional client-managed session affinity (mirrors /chat/completions).
-  const rawSessionId = req.headers['x-session-id'];
+  const rawSessionId = req.headers['x-codex-session-id']
+    ?? req.headers['session-id']
+    ?? req.headers['x-session-id'];
   const sessionIdHeader = Array.isArray(rawSessionId) ? rawSessionId[0] : rawSessionId;
-  const preferredModel = getStickyModel(messages, sessionIdHeader);
   const requestedModelLabel = reqData.model ?? 'auto';
+
+  // Explicit `model` field pins routing. If the catalog has no enabled row
+  // matching the requested id, return 400 — silently auto-routing to a
+  // different model would be surprising to Responses API clients.
+  // Priority: explicit model > sticky session > auto routing.
+  let preferredModel: number | undefined;
+  let groupChain: ChainRow[] | undefined;
+
+  if (isAutoModel(requestedModelLabel)) {
+    preferredModel = resolveStickyPreference(getStickyModel(messages, sessionIdHeader));
+  } else {
+    const db = getDb();
+    const resolved = isUnifyEnabled() ? resolveRequestedIdForDispatch(requestedModelLabel, getModelGroups()) : null;
+    const members = resolved?.memberDbIds ?? null;
+    if (members && members.length > 0) {
+      groupChain = resolveModelGroupCandidates(members, resolved!.demotedDbIds);
+      if (groupChain.length === 0) {
+        const placeholders = members.map(() => '?').join(',');
+        const anyEnabled = db.prepare(`SELECT 1 FROM models WHERE id IN (${placeholders}) AND enabled = 1 LIMIT 1`).get(...members);
+        const reason = anyEnabled ? 'has no providers with an enabled key' : 'is disabled';
+        res.status(400).json({
+          error: {
+            message: `Model '${requestedModelLabel}' ${reason}. Use 'auto' (or omit the 'model' field) to auto-route, or call /v1/models for the available list.`,
+            type: 'invalid_request_error',
+            code: 'model_not_found',
+          },
+        });
+        return;
+      }
+      const sticky = getStickyModel(messages, sessionIdHeader, requestedModelLabel);
+      preferredModel = (sticky != null && groupChain.some(r => r.model_db_id === sticky)) ? sticky : undefined;
+    } else {
+      const enabled = db.prepare('SELECT id FROM models WHERE model_id = ? AND enabled = 1').get(requestedModelLabel) as { id: number } | undefined;
+      if (enabled) {
+        preferredModel = enabled.id;
+      } else {
+        const disabled = db.prepare('SELECT id FROM models WHERE model_id = ?').get(requestedModelLabel) as { id: number } | undefined;
+        const reason = disabled ? 'is disabled' : 'is not in the catalog';
+        res.status(400).json({
+          error: {
+            message: `Model '${requestedModelLabel}' ${reason}. Use 'auto' (or omit the 'model' field) to auto-route, or call /v1/models for the available list.`,
+            type: 'invalid_request_error',
+            code: 'model_not_found',
+          },
+        });
+        return;
+      }
+    }
+  }
 
   // Tool-bearing requests (the normal case for Codex/agent clients on this
   // endpoint) must stay on models that emit structured tool_calls. Make the
@@ -367,6 +481,22 @@ responsesRouter.post('/responses', async (req: Request, res: Response) => {
 
   const responseId = newId('resp');
   const state = newFallbackState();
+  const attemptLog: AttemptRecord[] = [];
+  // Client-disconnect fan-out: the flag stops the loop before the NEXT
+  // attempt; the AbortController (threaded to the provider as
+  // CompletionOptions.signal) additionally cancels the IN-FLIGHT upstream
+  // fetch and any body/stream read, so tokens stop burning and the in-flight
+  // lease frees immediately. 'close' also fires on normal completion —
+  // writableEnded distinguishes a real disconnect.
+  let clientGone = false;
+  const clientAbort = new AbortController();
+  res.on('close', () => {
+    if (!res.writableEnded) {
+      clientGone = true;
+      clientAbort.abort(newClientAbortError());
+    }
+  });
+  const dispatchOpts = { ...completionOpts, signal: clientAbort.signal };
 
   // Stream bookkeeping (used only when stream === true). `streamStarted` is the
   // commit flag: true once the response.created/in_progress skeleton has left,
@@ -383,7 +513,9 @@ responsesRouter.post('/responses', async (req: Request, res: Response) => {
   await runFallbackLoop({
     maxRetries: MAX_RETRIES,
     state,
-    route: () => routeRequest(estimatedTotal, state.skipKeys.size > 0 ? state.skipKeys : undefined, preferredModel, false, wantsTools, state.skipModels.size > 0 ? state.skipModels : undefined),
+    attemptLog,
+    clientGone: () => clientGone,
+    route: () => routeRequest(estimatedTotal, state.skipKeys.size > 0 ? state.skipKeys : undefined, preferredModel, false, wantsTools, state.skipModels.size > 0 ? state.skipModels : undefined, groupChain, completionOpts.response_format !== undefined),
     dispatch: async (route, attempt) => {
       traceRouteEvent('Responses', {
         event: attempt === 0 ? 'start' : 'next',
@@ -420,8 +552,8 @@ responsesRouter.post('/responses', async (req: Request, res: Response) => {
           res.setHeader('Content-Type', 'text/event-stream');
           res.setHeader('Cache-Control', 'no-cache');
           res.setHeader('Connection', 'keep-alive');
-          res.setHeader('X-Routed-Via', `${route.platform}/${route.modelId}`);
-          if (attempt > 0) res.setHeader('X-Fallback-Attempts', String(attempt));
+          res.setHeader('X-Routed-Via', routedViaValue(route.platform, route.modelId));
+          setFallbackHeaders(res, attempt, attemptLog);
           const skeleton = {
             id: responseId, object: 'response', created_at: nowUnix(),
             status: 'in_progress', model: route.modelId, output: [], output_text: '',
@@ -454,11 +586,12 @@ responsesRouter.post('/responses', async (req: Request, res: Response) => {
             route.apiKey,
             messages,
             route.modelId,
-            completionOpts,
+            dispatchOpts,
             quotaContextForRoute(route, 'responses'),
           );
 
           for await (const chunk of gen) {
+            if (clientGone) break; // client hung up: stop pulling; reader.cancel() aborts upstream
             // In-band upstream error frame ({"error":...} inside a 200 SSE
             // stream — observed live from Groq). Throwing hands it to the catch
             // below: pre-commit it fails over, post-commit it surfaces
@@ -574,6 +707,15 @@ responsesRouter.post('/responses', async (req: Request, res: Response) => {
           // been committed yet (the skeleton is lazy), so throwing lets the
           // shared loop fail over to the next model on the same SSE connection.
           if (msgText.length === 0 && toolAcc.size === 0) {
+            // Disconnect before the commit point: the break above fired with
+            // nothing accumulated — CLIENT behavior, not a provider failure.
+            // Falling through to the empty-completion throw benched a healthy
+            // model+key for 90s on every Ctrl-C during a reasoning model's
+            // TTFB window.
+            if (clientGone && !streamStarted) {
+              console.log(`[Responses] client disconnected before first token from ${route.displayName} — dropping attempt without benching`);
+              return 'committed';
+            }
             // finish_reason 'length' = the model spent the whole output budget
             // on hidden reasoning before any visible text: fail over, but skip
             // the cooldown/penalty (not a provider-health signal).
@@ -625,6 +767,12 @@ responsesRouter.post('/responses', async (req: Request, res: Response) => {
           logRequest(route.platform, route.modelId, route.keyId, 'success', estimatedInputTokens, totalOutputTokens, Date.now() - start, null);
           return 'done';
         } catch (streamErr: any) {
+          // Client abort mid-stream: the pump's own `if (clientGone) break`
+          // can lose the race against the fetch-signal rejection, so the
+          // abort may surface here instead. Rethrow — the shared loop's
+          // client-abort branch stops the ladder without benching or an
+          // error log row (the socket is gone; nothing to render).
+          if (isClientAbortError(streamErr)) throw streamErr;
           // A committed stream can't fail over (bytes already sent) — surface a
           // response.failed event honestly and stop. A pre-commit failure throws
           // through to the shared loop for cooldown + failover.
@@ -652,7 +800,7 @@ responsesRouter.post('/responses', async (req: Request, res: Response) => {
         route.apiKey,
         messages,
         route.modelId,
-        completionOpts,
+        dispatchOpts,
         quotaContextForRoute(route, 'responses'),
       );
 
@@ -691,14 +839,33 @@ responsesRouter.post('/responses', async (req: Request, res: Response) => {
         );
       }
 
+      // Structured-output enforcement — see /chat/completions. Heal fenced or
+      // prose-wrapped JSON in place, fail over (skipBench + skipModelForRequest
+      // — a sibling key would misbehave identically) when the model ignored the
+      // requested format; finish_reason 'length' gets an honest "truncated"
+      // class instead, since the JSON was cut off by max_tokens, not ignored.
+      if (completionOpts.response_format && text && toolCalls.length === 0) {
+        const enforced = enforceJsonContent(text);
+        if (!enforced.ok) {
+          const truncated = result.choices[0]?.finish_reason === 'length';
+          throw Object.assign(
+            new Error(truncated
+              ? `truncated JSON from ${route.displayName} (finish_reason=length — raise max_tokens for this ${completionOpts.response_format.type} request)`
+              : `${route.displayName} ignored response_format (returned non-JSON despite ${completionOpts.response_format.type})`),
+            { skipBench: true, skipModelForRequest: true },
+          );
+        }
+        if (enforced.healed) text = enforced.content;
+      }
+
       // Usage fallback: a missing provider `usage` block used to record 0
       // tokens against the rate-limit ledger; promptTokens/completionTokens
       // above already carry the chars/4 estimate.
       recordUpstreamSuccess(route, result.usage?.total_tokens ?? (promptTokens + completionTokens));
       setStickyModel(messages, route.modelDbId, sessionIdHeader);
 
-      res.setHeader('X-Routed-Via', `${route.platform}/${route.modelId}`);
-      if (attempt > 0) res.setHeader('X-Fallback-Attempts', String(attempt));
+      res.setHeader('X-Routed-Via', routedViaValue(route.platform, route.modelId));
+      setFallbackHeaders(res, attempt, attemptLog);
       res.json(buildResponseObject({
         id: responseId, model: route.modelId, text, toolCalls,
         promptTokens, completionTokens,
@@ -732,30 +899,31 @@ responsesRouter.post('/responses', async (req: Request, res: Response) => {
       logRequest(route.platform, route.modelId, route.keyId, 'error', estimatedInputTokens, 0, latency, safeError);
     },
     onFatal: (route, err, attempt) => {
-      if (attempt > 0) res.setHeader('X-Fallback-Attempts', String(attempt));
+      setFallbackHeaders(res, attempt, attemptLog);
       res.status(502).json({ error: { message: `Provider error (${route.displayName}): ${sanitizeProviderErrorMessage(err.message)}`, type: 'provider_error' } });
     },
     onRoutingExhausted: (lastError, routeErr, exhaustion, info) => {
-      const status = exhaustion?.status ?? routeErr.status ?? 503;
-      const message = exhaustion?.message ?? routeErr.message;
-      const type = exhaustion?.type ?? 'routing_error';
       if (streamStarted) {
-        sse('response.failed', { response: { id: responseId, object: 'response', status: 'failed', error: { message, type } } });
+        // Headers are already on the wire — the honest status/Retry-After can
+        // only travel in the failed-event payload.
+        sse('response.failed', { response: { id: responseId, object: 'response', status: 'failed', error: exhaustionErrorPayload(exhaustion) } });
         res.end();
       } else {
-        if (info.attempts.length > 0) res.setHeader('X-Fallback-Attempts', String(info.attempts.length));
-        res.status(status).json({ error: { message, type } });
+        setFallbackHeaders(res, info.attempts.length, info.attempts);
+        setExhaustionHeaders(res, exhaustion);
+        res.status(exhaustion.status).json({ error: exhaustionErrorPayload(exhaustion) });
       }
     },
     onExhausted: (exhaustion, info) => {
       // The streaming skeleton may already be on the wire — close the SSE stream
       // with a failed event instead of writing JSON onto a committed response.
       if (streamStarted) {
-        sse('response.failed', { response: { id: responseId, object: 'response', status: 'failed', error: { message: exhaustion.message, type: exhaustion.type } } });
+        sse('response.failed', { response: { id: responseId, object: 'response', status: 'failed', error: exhaustionErrorPayload(exhaustion) } });
         res.end();
       } else {
-        if (info.attempts.length > 0) res.setHeader('X-Fallback-Attempts', String(info.attempts.length));
-        res.status(exhaustion.status).json({ error: { message: exhaustion.message, type: exhaustion.type } });
+        setFallbackHeaders(res, info.attempts.length, info.attempts);
+        setExhaustionHeaders(res, exhaustion);
+        res.status(exhaustion.status).json({ error: exhaustionErrorPayload(exhaustion) });
       }
     },
   });

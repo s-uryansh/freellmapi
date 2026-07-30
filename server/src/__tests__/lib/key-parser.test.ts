@@ -21,6 +21,19 @@ describe('key parser', () => {
     ]);
   });
 
+  it('unquotes dotenv values that carry an inline comment', () => {
+    expect(parseDotEnv('GOOGLE_API_KEY="ai-test" # primary\nGROQ_API_KEY=\'gsk-test\'  # backup')).toEqual([
+      { key: 'GOOGLE_API_KEY', value: 'ai-test' },
+      { key: 'GROQ_API_KEY', value: 'gsk-test' },
+    ]);
+  });
+
+  it('keeps a # that is inside the quotes', () => {
+    expect(parseDotEnv('NVIDIA_API_KEY="nv # test"')).toEqual([
+      { key: 'NVIDIA_API_KEY', value: 'nv # test' },
+    ]);
+  });
+
   it('parses flat JSON string values', () => {
     expect(parseJson(JSON.stringify({ MISTRAL_API_KEY: 'mist-test', PORT: 3001 }))).toEqual([
       { key: 'MISTRAL_API_KEY', value: 'mist-test' },
@@ -37,11 +50,23 @@ describe('key parser', () => {
   it('detects current provider prefixes', () => {
     expect(detectPlatform('GOOGLE_')).toBe('google');
     expect(detectPlatform('OLLAMA_CLOUD_')).toBe('ollama');
+    expect(detectPlatform('NARAROUTER_')).toBe('nara');
+    expect(detectPlatform('AIONLABS_')).toBe('aion');
+    expect(detectPlatform('REQUESTY_')).toBe('requesty');
+    expect(detectPlatform('NAVYAI_')).toBe('navy');
+    expect(detectPlatform('SEALION_')).toBe('sealion');
+    expect(detectPlatform('MODELSCOPE_')).toBe('modelscope');
     expect(detectPlatform('SAMBANOVA_')).toBeNull();
   });
 
   it('parses Hermes/OpenCode auth.json provider names', () => {
     expect(AUTH_JSON_PROVIDER_MAP['ollama-cloud']).toBe('ollama');
+    expect(AUTH_JSON_PROVIDER_MAP['bynara']).toBe('nara');
+    expect(AUTH_JSON_PROVIDER_MAP['aion-labs']).toBe('aion');
+    expect(AUTH_JSON_PROVIDER_MAP['requesty']).toBe('requesty');
+    expect(AUTH_JSON_PROVIDER_MAP['api-navy']).toBe('navy');
+    expect(AUTH_JSON_PROVIDER_MAP['sea-lion']).toBe('sealion');
+    expect(AUTH_JSON_PROVIDER_MAP['model-scope']).toBe('modelscope');
     const result = parseAuthJson(JSON.stringify({
       credential_pool: {
         gemini: [{ id: '1', label: 'Gemini', auth_type: 'api_key', access_token: 'AIza-test' }],
