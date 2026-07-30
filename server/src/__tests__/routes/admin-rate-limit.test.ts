@@ -1,6 +1,7 @@
 import { describe, it, expect, beforeAll } from 'vitest';
 import type { Express } from 'express';
 import { createApp } from '../../app.js';
+import { createAdminRateLimiter } from '../../middleware/rateLimit.js';
 import { initDb } from '../../db/index.js';
 import { mintDashboardToken } from '../helpers/auth.js';
 
@@ -34,20 +35,56 @@ describe('Admin API rate limiter', () => {
   it('sets X-RateLimit headers on admin API responses', async () => {
     const { headers, status } = await request(app, '/api/keys', token);
     expect(status).toBe(200);
-    expect(headers.get('x-ratelimit-limit')).toBe('60');
+    expect(headers.get('x-ratelimit-limit')).toBe('600');
     expect(Number(headers.get('x-ratelimit-remaining'))).toBeGreaterThanOrEqual(0);
     expect(Number(headers.get('x-ratelimit-reset'))).toBeGreaterThan(Date.now() / 1000);
   });
 
-  it('does not set rate limit headers on /api/ping', async () => {
+  it('applies the limiter to unauthenticated /api paths too', async () => {
     const { headers, status } = await request(app, '/api/ping');
     expect(status).toBe(200);
-    expect(headers.get('x-ratelimit-limit')).toBe('60');
+    expect(headers.get('x-ratelimit-limit')).toBe('600');
   });
 
   it('counts unauthenticated requests against the admin rate limit window', async () => {
     const { status } = await request(app, '/api/keys');
     // Unauthenticated still hits the rate limiter, then fails at requireAuth
     expect(status).toBe(401);
+  });
+
+  it('caps the broad admin surface well above normal dashboard traffic', async () => {
+    // The dashboard fans out across many /api routes on load and polls several
+    // of them, so the flood guard must not fire during ordinary use. Guarding
+    // the default here keeps a future tightening from silently breaking that.
+    const limiter = createAdminRateLimiter();
+    expect(limiter).toBeTypeOf('function');
+    const { headers } = await request(app, '/api/keys', token);
+    expect(Number(headers.get('x-ratelimit-limit'))).toBeGreaterThanOrEqual(600);
+  });
+
+  it('throttles key export far more tightly than the rest of /api', async () => {
+    // Export re-verifies the password, so it is the one guessable endpoint.
+    // Eleventh request inside the window must be refused regardless of whether
+    // the password was right.
+    let sawRateLimit = false;
+    for (let i = 0; i < 12; i++) {
+      const { status } = await request(app, '/api/keys/export?format=json', token);
+      if (status === 429) { sawRateLimit = true; break; }
+      // Without the re-auth header the handler answers 403 — still counted.
+      expect(status).toBe(403);
+    }
+    expect(sawRateLimit).toBe(true);
+  });
+
+  it('can be disabled entirely with ADMIN_RATE_LIMIT_RPM=0', async () => {
+    process.env.ADMIN_RATE_LIMIT_RPM = '0';
+    try {
+      const openApp = createApp();
+      const { headers, status } = await request(openApp, '/api/ping');
+      expect(status).toBe(200);
+      expect(headers.get('x-ratelimit-limit')).toBeNull();
+    } finally {
+      delete process.env.ADMIN_RATE_LIMIT_RPM;
+    }
   });
 });

@@ -28,6 +28,10 @@ import { ollamaRouter } from './routes/ollama.js';
 import { urlTokenRouter } from './routes/url-tokens.js';
 import { requireAuth } from './middleware/requireAuth.js';
 import { createProxyRateLimiter, createAdminRateLimiter } from './middleware/rateLimit.js';
+
+// Password-guess ceiling for GET /api/keys/export. Deliberately low: a real
+// user exports keys occasionally, never ten times a minute.
+const EXPORT_RATE_LIMIT_RPM = 10;
 import { errorHandler } from './middleware/errorHandler.js';
 import { clientContextMiddleware } from './lib/client-context.js';
 import type { Config } from './lib/config.js';
@@ -119,6 +123,12 @@ export function createApp(config?: Config) {
   // unauthenticated endpoints under /api (like /api/ping) are not blocked.
   const adminRateLimiter = createAdminRateLimiter();
   app.use('/api', adminRateLimiter);
+
+  // Key export re-verifies the dashboard password, which makes it the one admin
+  // endpoint a guesser can attack. The broad limiter above is sized for normal
+  // dashboard traffic and far too loose for that, so this path gets its own
+  // tight per-IP bucket on top of it.
+  app.use('/api/keys/export', createAdminRateLimiter(EXPORT_RATE_LIMIT_RPM));
 
   app.use('/api/keys', requireAuth, keysRouter);
   app.use('/api/models', requireAuth, modelsRouter);

@@ -78,15 +78,36 @@ export function createProxyRateLimiter(rpmLimit?: number) {
 }
 
 // Per-IP fixed-window rate limiter for the /api/* admin surface.
-// The dashboard is single-user, so the default is generous but prevents
-// brute-force attacks on auth or key-export endpoints.
-const ADMIN_DEFAULT_RPM = 60;
+//
+// This is a flood guard, not the brute-force guard: dashboard login already has
+// its own per-email lockout (routes/auth.ts), and the one admin endpoint that
+// verifies a password — GET /api/keys/export — gets its own much tighter
+// limiter mounted in app.ts. The broad cap therefore has to clear normal
+// dashboard traffic with room to spare. Opening the dashboard fans out across
+// keys, health, models, analytics, settings and profiles, and several of those
+// poll, so a single user legitimately spends dozens of requests a minute.
+//
+// Tune with ADMIN_RATE_LIMIT_RPM (requests per minute per IP); 0 disables it.
+const ADMIN_DEFAULT_RPM = 600;
 
-export function createAdminRateLimiter(rpm = ADMIN_DEFAULT_RPM) {
-  const limit = Math.max(1, Math.floor(rpm));
+function parseAdminLimit(): number {
+  const raw = process.env.ADMIN_RATE_LIMIT_RPM;
+  if (raw === undefined || raw.trim() === '') return ADMIN_DEFAULT_RPM;
+  const n = Number(raw);
+  if (!Number.isFinite(n) || n < 0) return ADMIN_DEFAULT_RPM;
+  return Math.floor(n);
+}
+
+export function createAdminRateLimiter(rpm?: number) {
+  const limit = rpm !== undefined ? Math.floor(Math.max(0, rpm)) : parseAdminLimit();
   const windows = new Map<string, WindowState>();
 
   return function adminRateLimit(req: Request, res: Response, next: NextFunction): void {
+    if (limit === 0) {
+      next();
+      return;
+    }
+
     const now = Date.now();
     const ip = req.ip ?? req.socket.remoteAddress ?? 'unknown';
 
